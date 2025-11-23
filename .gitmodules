@@ -1,0 +1,9 @@
+[submodule "submodules/gaussian-splatting"]
+	path = submodules/gaussian-splatting
+	url = https://github.com/graphdeco-inria/gaussian-splatting
+[submodule "submodules/RoMa"]
+	path = submodules/RoMa
+	url = git@github.com:Parskatt/RoMa.git
+[submodule "submodules/depth-anything-v2"]
+	path = submodules/depth-anything-v2
+	url = https://github.com/DepthAnything/Depth-Anything-V2.git
