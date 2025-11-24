@@ -2,6 +2,7 @@ import sys
 sys.path.append('../')
 sys.path.append("../submodules")
 sys.path.append('../submodules/RoMa')
+sys.path.append('./submodules/gaussian-splatting/')
 
 from matplotlib import pyplot as plt
 from PIL import Image
@@ -21,6 +22,9 @@ from romatch.utils import get_tuple_transform_ops
 import time
 from collections import defaultdict
 from tqdm import tqdm
+from PIL import Image as PILImage
+import cv2
+from utils.graphic_utils import fov2focal
 
 
 def pairwise_distances(matrix):
@@ -516,6 +520,72 @@ def select_best_keypoints(
 
     return NNs_triangulated_points_selected, np.min(NNs_errors_proj, axis=0)
 
+def dense_init_gaussians(gaussians, scene, fx, fy, cx, cy, selected_indices, images_path, pcd, device, mde_model=None):
+    resolution = 1.0
+    viewpoint_stack = scene.getTrainCameras().copy()
+    
+    selected_viewpoints = [viewpoint_stack[i] for i in selected_indices]
+    images = []
+    depths = []
+    est_depths = []
+    masked_est_depths = []
+    extrinsics = []
+    K = np.array([[fx/resolution, 0, cx/resolution],
+                  [0, fy/resolution, cy/resolution],
+                  [0, 0, 1]])
+    
+    for viewpoint in selected_viewpoints:
+        pil_im = PILImage.open(f"{images_path}/{viewpoint.image_name}")
+        # pil_im = pil_im.resize(resolution)
+        cv2_im = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
+        est_depth = mde_model.infer_image(cv2_im) # HxW raw depth map in numpy
+
+        # Project point cloud to get ground truth depth
+        W2C = viewpoint.world_view_transform.detach().cpu().numpy()
+        homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
+        cam_coords = (W2C @ homegeneous_coords.T).T  # Nx4
+        cam_coords = cam_coords[:, :3]
+        pixel_coords = (K @ cam_coords.T).T  # Nx3
+        u = pixel_coords[:, 0] / pixel_coords[:, 2]
+        v = pixel_coords[:, 1] / pixel_coords[:, 2]
+        depth = cam_coords[:, 2]  # Z in camera space
+
+        h, w = est_depth.shape
+        valid_indices = np.where(
+            (depth > 0) &
+            (u >= 0) & (u < w) &
+            (v >= 0) & (v < h)
+        )[0]
+        valid_u = u[valid_indices]
+        valid_v = v[valid_indices]
+        valid_depth = depth[valid_indices].reshape(-1,1) 
+
+        valid_u = np.round(valid_u).astype(int)
+        valid_v = np.round(valid_v).astype(int)
+        
+        masked_est_depth = est_depth[valid_v, valid_u].reshape(-1,1)
+
+        #get extrinsic
+        ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy()
+        ext_repeated = np.tile(ext, (len(valid_v), 1)) 
+        
+        est_depth = est_depth.reshape(-1,1)
+
+
+        images.append(np.array(cv2_im))
+        est_depths.append(est_depth)
+        depths.append(valid_depth)
+        extrinsics.append(ext_repeated)
+        masked_est_depths.append(masked_est_depth)
+    
+    all_est_depths = np.vstack(est_depths)
+    all_masked_est_depths = np.vstack(masked_est_depths)
+    all_gt_depths = np.vstack(depths)
+    all_extrinsics = np.vstack(extrinsics)
+
+    embeddings = np.hstack([all_masked_est_depths, all_extrinsics])
+    print("embeddings.shape:", embeddings.shape)
+    print("all_depths.shape:", all_gt_depths.shape)
 
 
 def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, roma_model=None):
