@@ -667,7 +667,7 @@ def dense_init_gaussians(gaussians,
             pseudo = 1.0 / (inv + 1e-6)
             orig_maps.append(pseudo.reshape(h, w))
 
-            X_tensor = torch.tensor(test_X, dtype=torch.float32).to(trainer.device)
+            X_tensor = torch.tensor(test_X, dtype=torch.float32).to(device)
             pred = mlp_model(X_tensor).cpu().numpy().reshape(h, w)
             pred_maps.append(pred)
 
