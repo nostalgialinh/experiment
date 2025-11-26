@@ -18,7 +18,7 @@ custom_theme = Theme({
     "danger": "bold red"
 })
 
-from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast
+from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast, dense_init_gaussians
 from source.utils_aux import log_samples
 
 from source.timer import Timer
@@ -213,6 +213,36 @@ class EDGSTrainer:
         torch.save((self.GS.gaussians.capture(), self.gs_step),
                 self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
 
+
+    def init_with_depth(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, verbose=False):
+        if not cfg.use:
+            return None
+        N_splats_at_init = len(self.GS.gaussians._xyz)
+        print("N_splats_at_init:", N_splats_at_init)
+        orig_maps, pred_maps = dense_init_gaussians(self.GS.gaussians,
+                                                    self.scene,
+                                                    fx=fx, fy=fy, cx=cx, cy=cy,
+                                                    selected_indices=selected_indices,
+                                                    images_path=images_path,
+                                                    pcd = pcd,
+                                                    device = self.device,
+                                                    mde_model = mde_model
+                                                    )
+
+        # Remove SfM points and leave only matchings inits
+        if not cfg.add_SfM_init:
+            with torch.no_grad():
+                N_splats_after_init = len(self.GS.gaussians._xyz)
+                print("N_splats_after_init:", N_splats_after_init)
+                self.gaussians.tmp_radii = torch.zeros(self.gaussians._xyz.shape[0]).to(self.device)
+                mask = torch.concat([torch.ones(N_splats_at_init, dtype=torch.bool),
+                                    torch.zeros(N_splats_after_init-N_splats_at_init, dtype=torch.bool)],
+                                axis=0)
+                self.GS.gaussians.prune_points(mask)
+        with torch.no_grad():
+            gaussians =  self.gaussians
+            gaussians._scaling =  gaussians.scaling_inverse_activation(gaussians.scaling_activation(gaussians._scaling)*0.5)
+        return orig_maps, pred_maps
 
     def init_with_corr(self, cfg, verbose=False, roma_model=None): 
         """
