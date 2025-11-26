@@ -41,11 +41,11 @@ class MLP(torch.nn.Module):
         self.relu = torch.nn.ReLU()
         self.to(device)
 
-        def forward(self, x):
-            x = self.linear1(x)
-            x = self.relu(x)
-            x = self.linear2(x)
-            return x
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
 
     def train(self, X, Y, epochs=1000, lr=0.001):
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
