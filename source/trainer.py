@@ -20,10 +20,11 @@ custom_theme = Theme({
     "warning": "magenta",
     "danger": "bold red"
 })
+import cv2
+import os
 
 
-
-from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast, dense_init_gaussians_worker
+from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast
 from source.utils_aux import log_samples
 
 from source.timer import Timer
@@ -247,12 +248,27 @@ class EDGSTrainer:
                 self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
 
 
-    def init_with_depth(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, verbose=False):
+    def save_data_with_names(image_names, W2Cs, orig_maps, pred_maps, save_path):
+    # Prepare dictionary for np.savez
+        save_dict = {}
+        for i, name in enumerate(image_names):
+            # Clean image name to be a valid key (remove extension or replace dots)
+            key_w2c = f"{name}_W2C"
+            key_orig = f"{name}_orig"
+            key_pred = f"{name}_pred"
+
+            save_dict[key_w2c] = W2Cs[i]
+            save_dict[key_orig] = orig_maps[i]
+            save_dict[key_pred] = pred_maps[i]
+
+        np.savez_compressed(save_path, **save_dict)
+
+    def init_with_depth1(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, verbose=False):
         if not cfg.use:
             return None, None
 
-        N_splats_at_init = len(self.GS.gaussians._xyz)
-        print("N_splats_at_init:", N_splats_at_init)
+        self.N_splats_at_init = len(self.GS.gaussians._xyz)
+        print("N_splats_at_init:", self.N_splats_at_init)
 
         viewpoint_stack = self.scene.getTrainCameras().copy()
         selected_viewpoints = [viewpoint_stack[i] for i in selected_indices]
@@ -265,6 +281,7 @@ class EDGSTrainer:
         masked_est_depths = []
         extrinsics = []
         W2Cs = []
+        image_names = []
 
         K = np.array([[fx / resolution, 0, cx / resolution],
                     [0, fy / resolution, cy / resolution],
@@ -273,6 +290,7 @@ class EDGSTrainer:
 
         # 1) Build training data for MLP
         for viewpoint in selected_viewpoints:
+            image_names.append(viewpoint.image_name)
             pil_im = PILImage.open(f"{images_path}/{viewpoint.image_name}")
             cv2_im = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
             pil_im.close()
@@ -374,22 +392,22 @@ class EDGSTrainer:
         # gc.collect()
 
         print('Done training MLP')
-        # Run dense_init_gaussians in a separate process
-        ctx = mp.get_context("spawn")  # safer with CUDA / heavy C++ libs
+        
+        # Save W2Cs and pred maps with image names
+        save_path = os.path.join(self.scene.model_path, f"dense_init_depth_data.npz")
+        self.save_data_with_names(image_names, W2Cs, orig_maps, pred_maps, save_path)
+        print(f"Saved dense init depth data to {save_path}")
 
-        args = (
-            fx, fy, cx, cy,
-            images,
-            pred_maps,
-            W2Cs
-        )
-        all_new_xyz = None
-        all_new_features_dc = None
-        with ctx.Pool(1) as pool:
-            orig_maps, pred_maps, all_new_xyz, all_new_features_dc = pool.apply(dense_init_gaussians_worker, (args,))
 
         # At this point, the worker process has exited and the OS has
         # reclaimed all RAM used by ScalableTSDFVolume inside dense_init_gaussians.
+    
+    def init_with_depth2(self, cfg, input_path):
+        xyz_path = input_path + '/all_new_xyz.pt'
+        features_dc_path = input_path + '/all_new_features_dc.pt'
+        all_new_xyz = torch.load(xyz_path)
+        all_new_features_dc = torch.load(features_dc_path)
+        
         with torch.no_grad():
             N = all_new_xyz.shape[0]
             gaussians = self.gaussians
@@ -421,8 +439,8 @@ class EDGSTrainer:
                 )
                 mask = torch.concat(
                     [
-                        torch.ones(N_splats_at_init, dtype=torch.bool),
-                        torch.zeros(N_splats_after_init - N_splats_at_init, dtype=torch.bool),
+                        torch.ones(self.N_splats_at_init, dtype=torch.bool),
+                        torch.zeros(N_splats_after_init - self.N_splats_at_init, dtype=torch.bool),
                     ],
                     axis=0,
                 )
@@ -434,7 +452,6 @@ class EDGSTrainer:
                 gaussians.scaling_activation(gaussians._scaling) * 0.5
             )
 
-        return orig_maps, pred_maps
 
     def init_with_corr(self, cfg, verbose=False, roma_model=None): 
         """
