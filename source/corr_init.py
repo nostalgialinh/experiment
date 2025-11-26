@@ -650,7 +650,7 @@ def dense_init_gaussians(gaussians,
                     output_dim=output_dim)
 
     X = torch.tensor(embeddings, dtype=torch.float32).to(device)
-    Y = torch.tensor(all_gt_depths, dtype=torch.float32).to(trainer.device)
+    Y = torch.tensor(all_gt_depths, dtype=torch.float32).to(device)
 
     mlp_model.train(X, Y, epochs=1000, lr=0.001)
 
