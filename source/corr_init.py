@@ -30,34 +30,6 @@ from utils.graphics_utils import fov2focal
 import gc
 import open3d as o3d
 
-from torch.nn import Linear as Linear
-
-class MLP(torch.nn.Module):
-    def __init__(self, device, input_dim, hidden_dim, output_dim):
-        super(MLP, self).__init__()
-        self.device = device
-        self.linear1 = Linear(input_dim, hidden_dim)
-        self.linear2 = Linear(hidden_dim, output_dim)
-        self.relu = torch.nn.ReLU()
-        self.to(device)
-
-    def forward(self, x):
-        x = self.linear1(x)
-        x = self.relu(x)
-        x = self.linear2(x)
-        return x
-
-    def train(self, X, Y, epochs=1000, lr=0.001):
-        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
-        criterion = torch.nn.MSELoss()
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            outputs = self(X)
-            loss = criterion(outputs, Y)
-            loss.backward()
-            optimizer.step()
-            if epoch % 100 == 0:
-                print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.4f}')
 
 
 def pairwise_distances(matrix):
@@ -553,227 +525,77 @@ def select_best_keypoints(
 
     return NNs_triangulated_points_selected, np.min(NNs_errors_proj, axis=0)
 
-def dense_init_gaussians(gaussians,
-                          scene,
+def dense_init_gaussians( 
                           fx, fy, cx, cy,
-                          selected_indices,
-                          images_path,
-                          pcd, device,
-                          mde_model=None,
-                          scaling_factor=0.001):
-    resolution = 1.0
-    viewpoint_stack = scene.getTrainCameras().copy()
-    selected_viewpoints = [viewpoint_stack[i] for i in selected_indices]
-
-    images = []
-    est_depths = []
-    depths = []
-    masked_est_depths = []
-    extrinsics = []
-    W2Cs = []
-
-    K = np.array([[fx / resolution, 0, cx / resolution],
-                  [0, fy / resolution, cy / resolution],
-                  [0, 0, 1]])
-    h, w = 0, 0
-
-    # 1) Build training data for MLP
-    for viewpoint in selected_viewpoints:
-        pil_im = PILImage.open(f"{images_path}/{viewpoint.image_name}")
-        cv2_im = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
-        pil_im.close()
-        # del pil_im
-
-        est_depth = mde_model.infer_image(cv2_im)  # HxW raw depth map in numpy
-
-        # Project point cloud to get ground truth depth
-        W2C = viewpoint.world_view_transform.detach().cpu().numpy()
-        W2Cs.append(W2C)
-
-        homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
-        cam_coords = (W2C @ homegeneous_coords.T).T  # Nx4
-        cam_coords = cam_coords[:, :3]
-        pixel_coords = (K @ cam_coords.T).T  # Nx3
-        u = pixel_coords[:, 0] / pixel_coords[:, 2]
-        v = pixel_coords[:, 1] / pixel_coords[:, 2]
-        depth = cam_coords[:, 2]  # Z in camera space
-
-        h, w = est_depth.shape
-        valid_indices = np.where(
-            (depth > 0) &
-            (u >= 0) & (u < w) &
-            (v >= 0) & (v < h)
-        )[0]
-        valid_u = np.floor(u[valid_indices]).astype(int)
-        valid_v = np.floor(v[valid_indices]).astype(int)
-        valid_depth = depth[valid_indices].reshape(-1, 1)
-
-        masked_est_depth = est_depth[valid_v, valid_u].reshape(-1, 1)
-
-        # get extrinsic
-        ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy()
-        ext_repeated = np.tile(ext, (len(valid_v), 1))
-
-        est_depth_flat = est_depth.reshape(-1, 1)
-        ext_repeated_est = np.tile(ext, (len(est_depth_flat), 1))
-        est_depth_with_ext = np.hstack((est_depth_flat, ext_repeated_est))
-
-        images.append(cv2_im)
-        est_depths.append(est_depth_with_ext)
-        depths.append(valid_depth)
-        extrinsics.append(ext_repeated)
-        masked_est_depths.append(masked_est_depth)
-
-        # del cv2_im, est_depth, homegeneous_coords, cam_coords
-        # del pixel_coords, u, v, depth, valid_indices, valid_u, valid_v
-        # del masked_est_depth, valid_depth, ext, ext_repeated
-        # del est_depth_flat, ext_repeated_est, est_depth_with_ext
-        # gc.collect()
-
-    all_masked_est_depths = np.vstack(masked_est_depths)
-    all_gt_depths = np.vstack(depths)
-    all_extrinsics = np.vstack(extrinsics)
-
-    embeddings = np.hstack([all_masked_est_depths, all_extrinsics])
-
-    # del all_masked_est_depths, all_extrinsics, masked_est_depths, extrinsics
-    # gc.collect()
-
-    # 2) Train MLP for depth correction
-    input_dim = embeddings.shape[1]
-    output_dim = all_gt_depths.shape[1]
-    hidden_dim = 128
-
-    mlp_model = MLP(device=device,
-                    input_dim=input_dim,
-                    hidden_dim=hidden_dim,
-                    output_dim=output_dim)
-
-    X = torch.tensor(embeddings, dtype=torch.float32).to(device)
-    Y = torch.tensor(all_gt_depths, dtype=torch.float32).to(device)
-
-    mlp_model.train(X, Y, epochs=1000, lr=0.001)
-
-    # # We no longer need training data on CPU
-    # del embeddings, all_gt_depths, X, Y
-    # gc.collect()
-
-    orig_maps = []
-    pred_maps = []
-
-    with torch.no_grad():
-        for test_X in est_depths:
-            inv = test_X[:, 0]
-            pseudo = 1.0 / (inv + 1e-6)
-            orig_maps.append(pseudo.reshape(h, w))
-
-            X_tensor = torch.tensor(test_X, dtype=torch.float32).to(device)
-            pred = mlp_model(X_tensor).cpu().numpy().reshape(h, w)
-            pred_maps.append(pred)
-
-            del inv, pseudo, X_tensor, pred
-            gc.collect()
-
-    # Free MLP and training containers
-    del mlp_model, est_depths, depths
-    torch.cuda.empty_cache()
-    # gc.collect()
-
-    print('Done training MLP')
+                          images,
+                          pred_maps,
+                          W2Cs):
 
     # 3) TSDF integration with Open3D
 
-
-    voxel_length = 0.001  # adjust resolution
-    sdf_trunc = 0.04
-    tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=voxel_length,
-        sdf_trunc=sdf_trunc,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
-    )
-
-    for i in range(len(images)):
-        color_raw = o3d.geometry.Image(
-            cv2.cvtColor(np.array(images[i]), cv2.COLOR_BGR2RGB)
-        )
-        depth_raw = o3d.geometry.Image((pred_maps[i]).astype(np.uint16))
-
-        rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color_raw,
-            depth_raw,
-            depth_scale=1.0,
-            depth_trunc=5.0,
-            convert_rgb_to_intensity=False
+    with torch.no_grad():
+        voxel_length = 0.001  # adjust resolution
+        sdf_trunc = 0.04
+        tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
+            voxel_length=voxel_length,
+            sdf_trunc=sdf_trunc,
+            color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
         )
 
-        intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width=w, height=h,
-            fx=fx, fy=fy,
-            cx=cx, cy=cy
-        )
-        C2W = np.linalg.inv(W2Cs[i])
+        for i in range(len(images)):
+            color_raw = o3d.geometry.Image(
+                cv2.cvtColor(np.array(images[i]), cv2.COLOR_BGR2RGB)
+            )
+            depth_raw = o3d.geometry.Image((pred_maps[i]).astype(np.uint16))
 
-        tsdf_volume.integrate(rgbd_image, intrinsic, C2W)
+            rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                color_raw,
+                depth_raw,
+                depth_scale=1.0,
+                depth_trunc=5.0,
+                convert_rgb_to_intensity=False
+            )
 
-        # Per-frame cleanup
-    #     del color_raw, depth_raw, rgbd_image, intrinsic, C2W
-    #     gc.collect()
+            intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                width=w, height=h,
+                fx=fx, fy=fy,
+                cx=cx, cy=cy
+            )
+            C2W = np.linalg.inv(W2Cs[i])
 
-    # del images, pred_maps, W2Cs
-    # gc.collect()
+            tsdf_volume.integrate(rgbd_image, intrinsic, C2W)
 
-    mesh = tsdf_volume.extract_triangle_mesh()
-    pcd_o3d = tsdf_volume.extract_point_cloud()
 
-    # del mesh
-    # gc.collect()
+        # mesh = tsdf_volume.extract_triangle_mesh()
+        pcd_o3d = tsdf_volume.extract_point_cloud()
 
-    points_np = np.asarray(pcd_o3d.points)
-    colors_np = np.asarray(pcd_o3d.colors)
 
-    all_new_xyz = torch.from_numpy(points_np).float()
-    N = all_new_xyz.shape[0]
-    print(f"Number of splats after dense init: {N}")
+        points_np = np.asarray(pcd_o3d.points)
+        colors_np = np.asarray(pcd_o3d.colors)
 
-    all_new_rgb = torch.from_numpy(colors_np).float()
-    all_new_features_dc = RGB2SH(all_new_rgb.detach().clone() / 255.).unsqueeze(1)
+        all_new_xyz = torch.from_numpy(points_np).float()
+        N = all_new_xyz.shape[0]
+        print(f"Number of splats after dense init: {N}")
 
-    all_new_features_rest = torch.stack(
-        [gaussians._features_rest[-1].clone().detach() * 0.] * N, dim=0
+        all_new_rgb = torch.from_numpy(colors_np).float()
+        all_new_features_dc = RGB2SH(all_new_rgb.detach().clone() / 255.).unsqueeze(1)
+
+    return all_new_xyz, all_new_features_dc
+
+def dense_init_gaussians_worker(args):
+    (
+        fx, fy, cx, cy,
+        images,
+        pred_maps,
+        W2Cs) = args
+
+    # Just call your existing function
+    return dense_init_gaussians(
+        fx, fy, cx, cy,
+        images,
+        pred_maps,
+        W2Cs
     )
-    all_new_opacities = torch.stack(
-        [gaussians._opacity[-1].clone().detach()] * N, dim=0
-    )
-    all_new_scaling = torch.stack(
-        [gaussians._scaling[-1].clone().detach()] * N, dim=0
-    )
-    all_new_rotation = torch.stack(
-        [gaussians._rotation[-1].clone().detach()] * N, dim=0
-    )
-
-    new_tmp_radii = torch.zeros(all_new_xyz.shape[0])
-    prune_mask = torch.ones(all_new_xyz.shape[0], dtype=torch.bool)
-
-    gaussians.densification_postfix(
-        all_new_xyz[prune_mask].to(device),
-        all_new_features_dc[prune_mask].to(device),
-        all_new_features_rest[prune_mask].to(device),
-        all_new_opacities[prune_mask].to(device),
-        all_new_scaling[prune_mask].to(device),
-        all_new_rotation[prune_mask].to(device),
-        new_tmp_radii[prune_mask].to(device)
-    )
-
-    # Cleanup Open3D / TSDF and all intermediates
-    # del tsdf_volume, pcd_o3d
-    # del points_np, colors_np
-    # del all_new_xyz, all_new_rgb, all_new_features_dc
-    # del all_new_features_rest, all_new_opacities, all_new_scaling, all_new_rotation
-    # del new_tmp_radii, prune_mask
-    # gc.collect()
-
-    return orig_maps, pred_maps
-
 
 def init_gaussians_with_corr(gaussians, scene, cfg, device, verbose = False, roma_model=None):
     """

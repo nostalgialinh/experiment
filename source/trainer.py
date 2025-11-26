@@ -11,17 +11,50 @@ import lpips
 from source.losses import ssim, l1_loss, psnr
 from rich.console import Console
 from rich.theme import Theme
-
+import multiprocessing as mp
+import numpy as np
+import gc
+from PIL import Image as PILImage
 custom_theme = Theme({
     "info": "dim cyan",
     "warning": "magenta",
     "danger": "bold red"
 })
 
-from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast, dense_init_gaussians
+
+
+from source.corr_init import init_gaussians_with_corr, init_gaussians_with_corr_fast, dense_init_gaussians_worker
 from source.utils_aux import log_samples
 
 from source.timer import Timer
+from torch.nn import Linear as Linear
+
+class MLP(torch.nn.Module):
+    def __init__(self, device, input_dim, hidden_dim, output_dim):
+        super(MLP, self).__init__()
+        self.device = device
+        self.linear1 = Linear(input_dim, hidden_dim)
+        self.linear2 = Linear(hidden_dim, output_dim)
+        self.relu = torch.nn.ReLU()
+        self.to(device)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
+
+    def train(self, X, Y, epochs=1000, lr=0.001):
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        criterion = torch.nn.MSELoss()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            outputs = self(X)
+            loss = criterion(outputs, Y)
+            loss.backward()
+            optimizer.step()
+            if epoch % 100 == 0:
+                print(f'Epoch [{epoch}/{epochs}], Loss: {loss.item():.4f}')
 
 class EDGSTrainer:
     def __init__(self,
@@ -216,32 +249,191 @@ class EDGSTrainer:
 
     def init_with_depth(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, verbose=False):
         if not cfg.use:
-            return None
+            return None, None
+
         N_splats_at_init = len(self.GS.gaussians._xyz)
         print("N_splats_at_init:", N_splats_at_init)
-        orig_maps, pred_maps = dense_init_gaussians(self.GS.gaussians,
-                                                    self.scene,
-                                                    fx=fx, fy=fy, cx=cx, cy=cy,
-                                                    selected_indices=selected_indices,
-                                                    images_path=images_path,
-                                                    pcd = pcd,
-                                                    device = self.device,
-                                                    mde_model = mde_model
-                                                    )
+
+        viewpoint_stack = self.scene.getTrainCameras().copy()
+        selected_viewpoints = [viewpoint_stack[i] for i in selected_indices]
+        resolution = 1.0
+        device = self.device
+
+        images = []
+        est_depths = []
+        depths = []
+        masked_est_depths = []
+        extrinsics = []
+        W2Cs = []
+
+        K = np.array([[fx / resolution, 0, cx / resolution],
+                    [0, fy / resolution, cy / resolution],
+                    [0, 0, 1]])
+        h, w = 0, 0
+
+        # 1) Build training data for MLP
+        for viewpoint in selected_viewpoints:
+            pil_im = PILImage.open(f"{images_path}/{viewpoint.image_name}")
+            cv2_im = cv2.cvtColor(np.array(pil_im), cv2.COLOR_RGB2BGR)
+            pil_im.close()
+            # del pil_im
+
+            est_depth = mde_model.infer_image(cv2_im)  # HxW raw depth map in numpy
+
+            # Project point cloud to get ground truth depth
+            W2C = viewpoint.world_view_transform.detach().cpu().numpy()
+            W2Cs.append(W2C)
+
+            homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
+            cam_coords = (W2C @ homegeneous_coords.T).T  # Nx4
+            cam_coords = cam_coords[:, :3]
+            pixel_coords = (K @ cam_coords.T).T  # Nx3
+            u = pixel_coords[:, 0] / pixel_coords[:, 2]
+            v = pixel_coords[:, 1] / pixel_coords[:, 2]
+            depth = cam_coords[:, 2]  # Z in camera space
+
+            h, w = est_depth.shape
+            valid_indices = np.where(
+                (depth > 0) &
+                (u >= 0) & (u < w) &
+                (v >= 0) & (v < h)
+            )[0]
+            valid_u = np.floor(u[valid_indices]).astype(int)
+            valid_v = np.floor(v[valid_indices]).astype(int)
+            valid_depth = depth[valid_indices].reshape(-1, 1)
+
+            masked_est_depth = est_depth[valid_v, valid_u].reshape(-1, 1)
+
+            # get extrinsic
+            ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy()
+            ext_repeated = np.tile(ext, (len(valid_v), 1))
+
+            est_depth_flat = est_depth.reshape(-1, 1)
+            ext_repeated_est = np.tile(ext, (len(est_depth_flat), 1))
+            est_depth_with_ext = np.hstack((est_depth_flat, ext_repeated_est))
+
+            images.append(cv2_im)
+            est_depths.append(est_depth_with_ext)
+            depths.append(valid_depth)
+            extrinsics.append(ext_repeated)
+            masked_est_depths.append(masked_est_depth)
+
+            # del cv2_im, est_depth, homegeneous_coords, cam_coords
+            # del pixel_coords, u, v, depth, valid_indices, valid_u, valid_v
+            # del masked_est_depth, valid_depth, ext, ext_repeated
+            # del est_depth_flat, ext_repeated_est, est_depth_with_ext
+            # gc.collect()
+
+        all_masked_est_depths = np.vstack(masked_est_depths)
+        all_gt_depths = np.vstack(depths)
+        all_extrinsics = np.vstack(extrinsics)
+
+        embeddings = np.hstack([all_masked_est_depths, all_extrinsics])
+
+        del all_masked_est_depths, all_extrinsics, masked_est_depths, extrinsics
+        gc.collect()
+
+        # 2) Train MLP for depth correction
+        input_dim = embeddings.shape[1]
+        output_dim = all_gt_depths.shape[1]
+        hidden_dim = 128
+
+        mlp_model = MLP(device=device,
+                        input_dim=input_dim,
+                        hidden_dim=hidden_dim,
+                        output_dim=output_dim)
+
+        X = torch.tensor(embeddings, dtype=torch.float32).to(device)
+        Y = torch.tensor(all_gt_depths, dtype=torch.float32).to(device)
+
+        mlp_model.train(X, Y, epochs=1000, lr=0.001)
+
+        # # We no longer need training data on CPU
+        del embeddings, all_gt_depths, X, Y
+        gc.collect()
+
+        orig_maps = []
+        pred_maps = []
+
+        with torch.no_grad():
+            for test_X in est_depths:
+                inv = test_X[:, 0]
+                pseudo = 1.0 / (inv + 1e-6)
+                orig_maps.append(pseudo.reshape(h, w))
+
+                X_tensor = torch.tensor(test_X, dtype=torch.float32).to(device)
+                pred = mlp_model(X_tensor).cpu().numpy().reshape(h, w)
+                pred_maps.append(pred)
+
+                del inv, pseudo, X_tensor, pred
+                gc.collect()
+
+        # Free MLP and training containers
+        del mlp_model, est_depths, depths
+        torch.cuda.empty_cache()
+        # gc.collect()
+
+        print('Done training MLP')
+        # Run dense_init_gaussians in a separate process
+        ctx = mp.get_context("spawn")  # safer with CUDA / heavy C++ libs
+
+        args = (
+            fx, fy, cx, cy,
+            images,
+            pred_maps,
+            W2Cs
+        )
+        all_new_xyz = None
+        all_new_features_dc = None
+        with ctx.Pool(1) as pool:
+            orig_maps, pred_maps, all_new_xyz, all_new_features_dc = pool.apply(dense_init_gaussians_worker, (args,))
+
+        # At this point, the worker process has exited and the OS has
+        # reclaimed all RAM used by ScalableTSDFVolume inside dense_init_gaussians.
+        with torch.no_grad():
+            N = all_new_xyz.shape[0]
+            gaussians = self.gaussians
+            all_new_features_rest = torch.stack([gaussians._features_rest[-1].clone().detach() * 0.] * N, dim=0)
+            all_new_opacities = torch.stack([gaussians._opacity[-1].clone().detach()] * N, dim=0)
+            all_new_scaling = torch.stack([gaussians._scaling[-1].clone().detach()] * N, dim=0)
+            all_new_rotation = torch.stack([gaussians._rotation[-1].clone().detach()] * N, dim=0)
+            new_tmp_radii = torch.zeros(all_new_xyz.shape[0])
+            prune_mask = torch.ones(all_new_xyz.shape[0], dtype=torch.bool)
+            gaussians.densification_postfix(
+                all_new_xyz[prune_mask].to(self.device),
+                all_new_features_dc[prune_mask].to(self.device),
+                all_new_features_rest[prune_mask].to(self.device),
+                all_new_opacities[prune_mask].to(self.device),
+                all_new_scaling[prune_mask].to(self.device),
+                all_new_rotation[prune_mask].to(self.device),
+                new_tmp_radii[prune_mask].to(self.device)
+            )
+
 
         # Remove SfM points and leave only matchings inits
         if not cfg.add_SfM_init:
             with torch.no_grad():
                 N_splats_after_init = len(self.GS.gaussians._xyz)
                 print("N_splats_after_init:", N_splats_after_init)
-                self.gaussians.tmp_radii = torch.zeros(self.gaussians._xyz.shape[0]).to(self.device)
-                mask = torch.concat([torch.ones(N_splats_at_init, dtype=torch.bool),
-                                    torch.zeros(N_splats_after_init-N_splats_at_init, dtype=torch.bool)],
-                                axis=0)
+                self.gaussians.tmp_radii = torch.zeros(
+                    self.gaussians._xyz.shape[0],
+                    device=self.device,
+                )
+                mask = torch.concat(
+                    [
+                        torch.ones(N_splats_at_init, dtype=torch.bool),
+                        torch.zeros(N_splats_after_init - N_splats_at_init, dtype=torch.bool),
+                    ],
+                    axis=0,
+                )
                 self.GS.gaussians.prune_points(mask)
+
         with torch.no_grad():
-            gaussians =  self.gaussians
-            gaussians._scaling =  gaussians.scaling_inverse_activation(gaussians.scaling_activation(gaussians._scaling)*0.5)
+            gaussians = self.gaussians
+            gaussians._scaling = gaussians.scaling_inverse_activation(
+                gaussians.scaling_activation(gaussians._scaling) * 0.5
+            )
+
         return orig_maps, pred_maps
 
     def init_with_corr(self, cfg, verbose=False, roma_model=None): 
