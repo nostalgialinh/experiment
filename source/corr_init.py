@@ -24,7 +24,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from PIL import Image as PILImage
 import cv2
-from utils.graphic_utils import fov2focal
+from utils.graphics_utils import fov2focal
 
 
 def pairwise_distances(matrix):
