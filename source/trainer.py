@@ -299,7 +299,7 @@ class EDGSTrainer:
             est_depth = mde_model.infer_image(cv2_im)  # HxW raw depth map in numpy
 
             # Project point cloud to get ground truth depth
-            W2C = viewpoint.world_view_transform.detach().cpu().numpy()
+            W2C = viewpoint.world_view_transform.detach().cpu().numpy().T
             W2Cs.append(W2C)
 
             homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
@@ -323,7 +323,7 @@ class EDGSTrainer:
             masked_est_depth = est_depth[valid_v, valid_u].reshape(-1, 1)
 
             # get extrinsic
-            ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy()
+            ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy().T
             ext_repeated = np.tile(ext, (len(valid_v), 1))
 
             est_depth_flat = est_depth.reshape(-1, 1)
