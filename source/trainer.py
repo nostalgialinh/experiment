@@ -248,7 +248,7 @@ class EDGSTrainer:
                 self.scene.model_path + "/chkpnt" + str(self.gs_step) + ".pth")
 
 
-    def save_data_with_names(image_names, W2Cs, orig_maps, pred_maps, save_path):
+    def save_data_with_names(self, image_names, W2Cs, orig_maps, pred_maps, save_path):
     # Prepare dictionary for np.savez
         save_dict = {}
         for i, name in enumerate(image_names):
@@ -446,11 +446,11 @@ class EDGSTrainer:
                 )
                 self.GS.gaussians.prune_points(mask)
 
-        with torch.no_grad():
-            gaussians = self.gaussians
-            gaussians._scaling = gaussians.scaling_inverse_activation(
-                gaussians.scaling_activation(gaussians._scaling) * 0.5
-            )
+        # with torch.no_grad():
+        #     gaussians = self.gaussians
+        #     gaussians._scaling = gaussians.scaling_inverse_activation(
+        #         gaussians.scaling_activation(gaussians._scaling) * 0.5
+        #     )
 
 
     def init_with_corr(self, cfg, verbose=False, roma_model=None): 
