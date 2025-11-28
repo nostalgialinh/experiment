@@ -364,7 +364,7 @@ class EDGSTrainer:
         X = torch.tensor(embeddings, dtype=torch.float32).to(device)
         Y = torch.tensor(all_gt_depths, dtype=torch.float32).to(device)
 
-        mlp_model.train(X, Y, epochs=1000, lr=0.001)
+        mlp_model.train(X, Y, epochs=500, lr=0.001)
 
         # # We no longer need training data on CPU
         del embeddings, all_gt_depths, X, Y

@@ -23,8 +23,8 @@ def dense_init_gaussians(
     # 3) TSDF integration with Open3D
 
     with torch.no_grad():
-        voxel_length = 0.001  # adjust resolution
-        sdf_trunc = 0.04
+        voxel_length = 0.01  # adjust resolution
+        sdf_trunc = voxel_length * 4
         tsdf_volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=voxel_length,
             sdf_trunc=sdf_trunc,
@@ -33,14 +33,14 @@ def dense_init_gaussians(
 
         for i in range(len(images)):
             color_raw = o3d.geometry.Image(
-                cv2.cvtColor(np.array(images[i]), cv2.COLOR_BGR2RGB)
+                np.array(images[i])
             )
-            depth_raw = o3d.geometry.Image((pred_maps[i]).astype(np.uint16))
+            depth_raw = o3d.geometry.Image((pred_maps[i]))
 
             rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
                 color_raw,
                 depth_raw,
-                depth_scale=1.0,
+                depth_scale=1000.0,
                 depth_trunc=5.0,
                 convert_rgb_to_intensity=False
             )
@@ -51,6 +51,8 @@ def dense_init_gaussians(
                 cx=cx, cy=cy
             )
             C2W = np.linalg.inv(W2Cs[i])
+            C2W[:3, 2] *= -1  # Flip the z axis
+            C2W[:3, 1] *= -1  # Flip the y axis
 
             tsdf_volume.integrate(rgbd_image, intrinsic, C2W)
 
@@ -67,7 +69,7 @@ def dense_init_gaussians(
         print(f"Number of splats after dense init: {N}")
 
         all_new_rgb = torch.from_numpy(colors_np).float()
-        all_new_features_dc = RGB2SH(all_new_rgb.detach().clone() / 255.).unsqueeze(1)
+        all_new_features_dc = RGB2SH(all_new_rgb.detach().clone()).unsqueeze(1)
 
     return all_new_xyz, all_new_features_dc
 
@@ -134,3 +136,4 @@ if __name__ == "__main__":
     os.makedirs(args.output_path, exist_ok=True)
     torch.save(all_new_xyz, args.output_path + '/all_new_xyz.pt')
     torch.save(all_new_features_dc, args.output_path + '/all_new_features_dc.pt')
+    print(f"Saved dense initialized gaussians to {args.output_path}")
