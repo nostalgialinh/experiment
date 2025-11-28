@@ -263,7 +263,7 @@ class EDGSTrainer:
 
         np.savez_compressed(save_path, **save_dict)
 
-    def init_with_depth1(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, verbose=False):
+    def init_with_depth1(self, cfg, images_path, pcd, selected_indices, fx, fy, cx, cy, mde_model, npy_path= None, use_pcd = True, verbose=False):
         if not cfg.use:
             return None, None
 
@@ -302,28 +302,36 @@ class EDGSTrainer:
             W2C = viewpoint.world_view_transform.detach().cpu().numpy().T
             W2Cs.append(W2C)
 
-            homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
-            cam_coords = (W2C @ homegeneous_coords.T).T  # Nx4
-            cam_coords = cam_coords[:, :3]
-            pixel_coords = (K @ cam_coords.T).T  # Nx3
-            u = pixel_coords[:, 0] / pixel_coords[:, 2]
-            v = pixel_coords[:, 1] / pixel_coords[:, 2]
-            depth = cam_coords[:, 2]  # Z in camera space
+            if use_pcd:
+                # Project point cloud to get depth map
+                homegeneous_coords = np.hstack((pcd, np.ones((pcd.shape[0], 1))))  # Nx4
+                cam_coords = (W2C @ homegeneous_coords.T).T  # Nx4
+                cam_coords = cam_coords[:, :3]
+                pixel_coords = (K @ cam_coords.T).T  # Nx3
+                u = pixel_coords[:, 0] / pixel_coords[:, 2]
+                v = pixel_coords[:, 1] / pixel_coords[:, 2]
+                depth = cam_coords[:, 2]  # Z in camera space
 
-            h, w = est_depth.shape
-            valid_indices = np.where(
-                (depth > 0) &
-                (u >= 0) & (u < w) &
-                (v >= 0) & (v < h)
-            )[0]
-            valid_u = np.floor(u[valid_indices]).astype(int)
-            valid_v = np.floor(v[valid_indices]).astype(int)
-            valid_depth = depth[valid_indices].reshape(-1, 1)
+                h, w = est_depth.shape
+                valid_indices = np.where(
+                    (depth > 0) &
+                    (u >= 0) & (u < w) &
+                    (v >= 0) & (v < h)
+                )[0]
+                valid_u = np.floor(u[valid_indices]).astype(int)
+                valid_v = np.floor(v[valid_indices]).astype(int)
+                valid_depth = depth[valid_indices].reshape(-1, 1)
+            else: #get depth from npy
+                npy_name = viewpoint.image_name.split('.')[0] + '.npy'
+                uv_depth = np.load(os.path.join(npy_path, npy_name))
+                valid_u = uv_depth[:, 0].astype(int)
+                valid_v = uv_depth[:, 1].astype(int)
+                valid_depth = uv_depth[:, 2].reshape(-1, 1)
 
             masked_est_depth = est_depth[valid_v, valid_u].reshape(-1, 1)
 
             # get extrinsic
-            ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy().T
+            ext = viewpoint.world_view_transform.T.flatten().detach().cpu().numpy()
             ext_repeated = np.tile(ext, (len(valid_v), 1))
 
             est_depth_flat = est_depth.reshape(-1, 1)
@@ -335,12 +343,6 @@ class EDGSTrainer:
             depths.append(valid_depth)
             extrinsics.append(ext_repeated)
             masked_est_depths.append(masked_est_depth)
-
-            # del cv2_im, est_depth, homegeneous_coords, cam_coords
-            # del pixel_coords, u, v, depth, valid_indices, valid_u, valid_v
-            # del masked_est_depth, valid_depth, ext, ext_repeated
-            # del est_depth_flat, ext_repeated_est, est_depth_with_ext
-            # gc.collect()
 
         all_masked_est_depths = np.vstack(masked_est_depths)
         all_gt_depths = np.vstack(depths)
