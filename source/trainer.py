@@ -297,6 +297,7 @@ class EDGSTrainer:
             # del pil_im
 
             est_depth = mde_model.infer_image(cv2_im)  # HxW raw depth map in numpy
+            h, w = est_depth.shape
 
             # Project point cloud to get ground truth depth
             W2C = viewpoint.world_view_transform.detach().cpu().numpy().T
@@ -312,7 +313,7 @@ class EDGSTrainer:
                 v = pixel_coords[:, 1] / pixel_coords[:, 2]
                 depth = cam_coords[:, 2]  # Z in camera space
 
-                h, w = est_depth.shape
+                
                 valid_indices = np.where(
                     (depth > 0) &
                     (u >= 0) & (u < w) &
@@ -331,7 +332,7 @@ class EDGSTrainer:
             masked_est_depth = est_depth[valid_v, valid_u].reshape(-1, 1)
 
             # get extrinsic
-            ext = viewpoint.world_view_transform.T.flatten().detach().cpu().numpy()
+            ext = viewpoint.world_view_transform.flatten().detach().cpu().numpy()
             ext_repeated = np.tile(ext, (len(valid_v), 1))
 
             est_depth_flat = est_depth.reshape(-1, 1)
@@ -350,8 +351,7 @@ class EDGSTrainer:
 
         embeddings = np.hstack([all_masked_est_depths, all_extrinsics])
 
-        del all_masked_est_depths, all_extrinsics, masked_est_depths, extrinsics
-        gc.collect()
+
 
         # 2) Train MLP for depth correction
         input_dim = embeddings.shape[1]
@@ -369,8 +369,6 @@ class EDGSTrainer:
         mlp_model.train(X, Y, epochs=N_epochs_MLP, lr=0.001)
 
         # # We no longer need training data on CPU
-        del embeddings, all_gt_depths, X, Y
-        gc.collect()
 
         orig_maps = []
         pred_maps = []
@@ -385,8 +383,6 @@ class EDGSTrainer:
                 pred = mlp_model(X_tensor).cpu().numpy().reshape(h, w)
                 pred_maps.append(pred)
 
-                del inv, pseudo, X_tensor, pred
-                gc.collect()
 
         # Free MLP and training containers
         del mlp_model, est_depths, depths
